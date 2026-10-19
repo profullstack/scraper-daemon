@@ -1,4 +1,5 @@
-export { createDaemon } from './daemon.js';
+export { createDaemon, jobIdFor, withTimeout } from './daemon.js';
+export { redisStore } from './redis-store.js';
 export { ms } from './duration.js';
 export { createFetcher, FetchError, isPublicAddress, retryAfter } from './fetch.js';
 export { hostGate } from './gate.js';

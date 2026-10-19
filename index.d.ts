@@ -83,14 +83,20 @@ export interface Daemon {
     },
   ): Daemon;
   start(): Daemon;
+  /** Resolves once the engine is connected (at once for the local engine). */
+  ready(): Promise<void>;
   stop(opts?: { graceMs?: number }): Promise<void>;
   runNow(task: string, key?: string): Promise<unknown>;
   refreshItems(task: string): void;
   status(): Promise<Record<string, unknown>>;
   holdHost(host: string, forMs: Duration): void;
   fetch: Fetcher;
-  store: Store;
+  readonly store: Store | null;
 }
+
+export function redisStore(client: unknown, opts?: { prefix?: string }): Store;
+export function jobIdFor(task: string, key: string): string;
+export function withTimeout<T, F>(p: Promise<T> | T, ms: number, fallback: F): Promise<T | F>;
 
 export interface RunEntry {
   job: string;
@@ -106,6 +112,13 @@ export interface RunEntry {
 
 export function createDaemon(opts?: {
   name?: string;
+  /** BullMQ engine: a Redis URL or a ready ioredis client. Without it the local (in-process) engine runs. */
+  redis?: string | unknown;
+  /** BullMQ queue name and Redis key prefix (default: name). */
+  queueName?: string;
+  /** Called after three missed Redis pings in a row; default logs and exits so the supervisor restarts. */
+  onRedisDown?: () => void;
+  /** Run records and task state. Default: Redis (beside the queue) with `redis`, memory without. */
   store?: Store;
   concurrency?: number;
   tickMs?: number;

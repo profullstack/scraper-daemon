@@ -30,9 +30,25 @@ import { memoryStore } from './store.js';
  */
 const DEFAULT_LADDER = ['5m', '15m', '1h', '3h', '6h', '12h', '1d'];
 
+const TICK = '__tick';
+
+/** A BullMQ job id for a task's key. BullMQ rejects ':' in custom ids, so every part is encoded. */
+export const jobIdFor = (task, key) => `${encodeURIComponent(task)}--${encodeURIComponent(key)}`.replace(/:/g, '%3A');
+
+/** Settle with `fallback` if `p` has not settled in `ms`: ioredis can wait forever on a dead socket. */
+export function withTimeout(p, msLimit, fallback) {
+  let t;
+  return Promise.race([Promise.resolve(p).finally(() => clearTimeout(t)), new Promise((resolve) => (t = setTimeout(() => resolve(fallback), msLimit)))]);
+}
+
 export function createDaemon({
   name = 'scraper-daemon',
-  store = memoryStore(),
+  // BullMQ: a Redis URL or a ready ioredis client. Production passes one; without it the local
+  // engine runs everything in this process (tests, dev).
+  redis = null,
+  queueName,
+  onRedisDown,
+  store: storeOption,
   concurrency = 4,
   tickMs = 5_000,
   jitter = 0.1,
@@ -47,6 +63,11 @@ export function createDaemon({
   const web = fetcher ?? createFetcher({ ...fetchOptions, gate, now });
   const tasks = [];
   const heldHosts = new Map();
+  // With Redis, run records and task state live beside the queue unless the site passes its own store.
+  let ownRedis = null;
+  let store = storeOption ?? (redis ? null : memoryStore());
+  let engine = null;
+  let ready = null;
   let timer = null;
   let stopping = null;
   let started = null;
@@ -85,13 +106,83 @@ export function createDaemon({
   }
 
   async function runs(t) {
-    if (!t.runs) t.runs = await store.load(t.name);
+    if (!t.runs) t.runs = await (await storeReady()).load(t.name);
     return t.runs;
+  }
+
+  /** The store, once it exists: with `redis` and no store given, a Redis store on the engine's connection. */
+  async function storeReady() {
+    if (store) return store;
+    const client = await connection();
+    const { redisStore } = await import('./redis-store.js');
+    store = redisStore(client, { prefix: `sd:${queueName ?? name}` });
+    return store;
+  }
+
+  let conn = null;
+  async function connection() {
+    if (conn) return conn;
+    if (typeof redis !== 'string') return (conn = redis);
+    const { default: IORedis } = await import('ioredis');
+    // BullMQ requires maxRetriesPerRequest: null; the watchdog covers the hang that causes.
+    conn = new IORedis(redis, { maxRetriesPerRequest: null, enableReadyCheck: true, connectionName: `${name}-scraper-daemon` });
+    ownRedis = conn;
+    return conn;
+  }
+
+  async function startBullmq() {
+    const { Queue, Worker } = await import('bullmq');
+    const client = await connection();
+    await storeReady();
+    const qname = (queueName ?? name).replace(/[^A-Za-z0-9._-]/g, '-');
+    // Events streams carry every job's return value; ours return nothing, and the cap keeps it that way.
+    const streams = { events: { maxLen: 100 } };
+    const queue = new Queue(qname, { connection: client, streams, defaultJobOptions: { removeOnComplete: true, removeOnFail: { count: 200 }, attempts: 1 } });
+    // The Worker blocks on its own connection; BullMQ does not close a connection it was handed, so close() does.
+    const workerConn = client.duplicate();
+    const worker = new Worker(qname, (job) => processJob(job), { connection: workerConn, concurrency: concurrency + 1, streams, lockDuration: 60_000 });
+    worker.on('error', (err) => log(`worker error: ${err?.message ?? err}`));
+    // One tick at a time across every process: BullMQ fires it, the Worker runs it.
+    await queue.upsertJobScheduler(TICK, { every: tickMs }, { name: TICK, data: {}, opts: { removeOnComplete: true, removeOnFail: true } });
+
+    let misses = 0;
+    const watchdog = setInterval(async () => {
+      const pong = await withTimeout(client.ping().catch(() => null), 5_000, null);
+      if (pong === 'PONG') {
+        misses = 0;
+        return;
+      }
+      misses++;
+      log(`redis did not answer (${misses} in a row)`);
+      if (misses >= 3) {
+        if (onRedisDown) onRedisDown();
+        else {
+          log('redis unreachable for 3 checks: exiting so the supervisor restarts with a fresh connection');
+          process.exit(1);
+        }
+      }
+    }, 30_000);
+    watchdog.unref?.();
+
+    engine = {
+      enqueue: (t, key) => queue.add(t.name, { key }, { jobId: jobIdFor(t.name, key) }),
+      counts: () => queue.getJobCounts('active', 'waiting', 'delayed', 'failed'),
+      async close() {
+        clearInterval(watchdog);
+        await worker.close();
+        await queue.close();
+        await workerConn.quit().catch(() => {});
+        if (ownRedis) await ownRedis.quit().catch(() => {});
+        conn = null;
+        ownRedis = null;
+      },
+    };
+    log(`started (bullmq queue ${qname}): ${tasks.map((t) => `${t.kind} ${t.name}`).join(', ')}`);
   }
 
   async function record(t, rec) {
     t.runs.set(rec.key, rec);
-    await store.save(t.name, rec);
+    await (await storeReady()).save(t.name, rec);
   }
 
   const ctxFor = (t, key, signal) => ({
@@ -103,8 +194,8 @@ export function createDaemon({
     fetch: web,
     holdHost: (host, forMs) => holdHost(host, forMs),
     state: {
-      get: (k) => store.get(`${t.name}:${k}`),
-      set: (k, v) => store.set(`${t.name}:${k}`, v),
+      get: async (k) => (await storeReady()).get(`${t.name}:${k}`),
+      set: async (k, v) => (await storeReady()).set(`${t.name}:${k}`, v),
     },
   });
 
@@ -256,13 +347,50 @@ export function createDaemon({
 
   /* ---------- the loop ---------- */
 
-  function launch(t, key, p) {
+  /**
+   * Start one unit of work. The local engine runs it here; the BullMQ engine enqueues a
+   * job the Worker runs (through the same attempt()), so it survives a restart and the
+   * queue is visible in Redis. Either way the work is counted until it settles.
+   */
+  function launch(t, key, run) {
     active++;
     t.running.add(key);
-    p.finally(() => {
-      active--;
-      t.running.delete(key);
-    }).catch(() => {});
+    const settle = () => {
+      if (t.running.delete(key)) active--;
+    };
+    if (engine) {
+      engine.enqueue(t, key).catch((err) => {
+        settle();
+        log(`[${t.name}] could not enqueue ${key}: ${err?.message ?? err}`);
+      });
+      return;
+    }
+    run().finally(settle).catch(() => {});
+  }
+
+  /** The BullMQ Worker's processor: the tick, or one unit of a task. Returns nothing, so Redis stores nothing. */
+  async function processJob(job) {
+    if (job.name === TICK) {
+      await tick();
+      return;
+    }
+    const t = tasks.find((x) => x.name === job.name);
+    if (!t) return;
+    const key = String(job.data?.key ?? '*');
+    // A job enqueued before a restart is not counted yet; count it while it runs.
+    if (!t.running.has(key)) {
+      t.running.add(key);
+      active++;
+    }
+    try {
+      await runs(t);
+      if (t.kind === 'queue') {
+        const items = await itemsOf(t);
+        await runQueueItem(t, { key, item: items.get(key) ?? { key } });
+      } else await (t.kind === 'pipeline' ? runPipeline(t) : runJob(t));
+    } finally {
+      if (t.running.delete(key)) active--;
+    }
   }
 
   let ticking = false;
@@ -295,9 +423,9 @@ export function createDaemon({
         if (t.kind === 'queue') {
           const room = Math.min(concurrency - active, t.concurrency - t.running.size);
           if (room <= 0) continue;
-          for (const c of await dueQueue(t, room)) launch(t, c.key, runQueueItem(t, c));
+          for (const c of await dueQueue(t, room)) launch(t, c.key, () => runQueueItem(t, c));
         } else if (dueJob(t).length) {
-          launch(t, '*', t.kind === 'pipeline' ? runPipeline(t) : runJob(t));
+          launch(t, '*', () => (t.kind === 'pipeline' ? runPipeline(t) : runJob(t)));
         }
       } catch (err) {
         log(`[${t.name}] could not schedule: ${err?.message ?? err}`);
@@ -316,19 +444,30 @@ export function createDaemon({
       return define('pipeline', spec);
     },
 
-    /** Start the loop. Safe to call once; returns the daemon. */
+    /** Start the loop. Safe to call once; returns the daemon (the BullMQ engine connects in the background). */
     start() {
-      if (timer) return api;
+      if (timer || ready) return api;
       started = now();
       stopping = null;
       controller = new AbortController();
-      log(`started: ${tasks.map((t) => `${t.kind} ${t.name}`).join(', ')}`);
+      if (redis) {
+        ready = startBullmq().catch((err) => {
+          log(`could not start the BullMQ engine: ${err?.message ?? err}`);
+          throw err;
+        });
+        ready.catch(() => {});
+        return api;
+      }
+      log(`started (local engine): ${tasks.map((t) => `${t.kind} ${t.name}`).join(', ')}`);
       const loop = () => tick().catch((err) => log(`tick failed: ${err?.message ?? err}`));
+      // A daemon is what keeps its process alive (a poller has no server to do it): never unref this timer.
       timer = setInterval(loop, tickMs);
-      timer.unref?.();
       loop();
       return api;
     },
+
+    /** Resolves once the engine is up (at once for the local engine). */
+    ready: () => ready ?? Promise.resolve(),
 
     /** Stop scheduling, abort what is running, and wait (up to graceMs) for it to settle. */
     async stop({ graceMs = 10_000 } = {}) {
@@ -336,6 +475,10 @@ export function createDaemon({
       timer = null;
       stopping ??= (async () => {
         controller.abort();
+        if (engine) {
+          await withTimeout(engine.close(), graceMs, null).catch(() => {});
+          engine = null;
+        }
         const until = now() + graceMs;
         while (active > 0 && now() < until) await new Promise((r) => setTimeout(r, 50));
       })();
@@ -389,16 +532,18 @@ export function createDaemon({
           out.push({ ...base, items: items.size, due: due + never, neverRun: never, failing, retired });
         } else {
           const x = r.get('*');
-          out.push({ ...base, nextAt: x?.nextAt ?? null, fails: x?.fails ?? 0, progress: t.kind === 'pipeline' ? await store.get(`${t.name}:progress`) : undefined });
+          out.push({ ...base, nextAt: x?.nextAt ?? null, fails: x?.fails ?? 0, progress: t.kind === 'pipeline' ? await (await storeReady()).get(`${t.name}:progress`) : undefined });
         }
       }
       return {
         name,
-        running: Boolean(timer),
+        engine: engine ? 'bullmq' : 'local',
+        queue: engine ? await withTimeout(engine.counts(), 3000, { error: 'redis did not answer in 3 s' }) : undefined,
+        running: Boolean(timer) || Boolean(engine),
         startedAt: started,
         active,
         concurrency,
-        store: store.kind ?? 'custom',
+        store: (await storeReady()).kind ?? 'custom',
         heldHosts: [...heldHosts].filter(([, until]) => until > now()).map(([host, until]) => ({ host, until })),
         tasks: out,
         recent: history.slice(-20).reverse(),
@@ -407,7 +552,10 @@ export function createDaemon({
 
     holdHost,
     fetch: web,
-    store,
+    /** The run/state store (null until the Redis store exists; `await daemon.ready()` first). */
+    get store() {
+      return store;
+    },
   };
   return api;
 }

@@ -1,19 +1,69 @@
 {
   "name": "@profullstack/scraper-daemon",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "type": "module",
-  "description": "One updater daemon for every listing site: periodic jobs, per-item refresh queues and resumable bulk pipelines, with polite, SSRF-safe fetching, robots.txt, per-host serial crawling, 429 hold-back, error ladders and SQLite/Postgres state. Zero dependencies.",
-  "keywords": ["scraper", "crawler", "daemon", "scheduler", "robots.txt", "ssrf", "polite", "bun", "sqlite", "postgres"],
-  "repository": { "type": "git", "url": "git+https://github.com/profullstack/scraper-daemon.git" },
+  "description": "One updater daemon for every listing site, on BullMQ: periodic jobs, per-item refresh queues and resumable bulk pipelines, with polite, SSRF-safe fetching, robots.txt, per-host serial crawling, 429 hold-back and error ladders. Each app keeps its data where it wants; the daemon keeps its queue and run state in Redis.",
+  "keywords": [
+    "bullmq",
+    "bun",
+    "crawler",
+    "daemon",
+    "polite",
+    "postgres",
+    "queue",
+    "redis",
+    "robots.txt",
+    "scheduler",
+    "scraper",
+    "sqlite",
+    "ssrf"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/profullstack/scraper-daemon.git"
+  },
   "homepage": "https://github.com/profullstack/scraper-daemon#readme",
-  "bugs": { "url": "https://github.com/profullstack/scraper-daemon/issues" },
+  "bugs": {
+    "url": "https://github.com/profullstack/scraper-daemon/issues"
+  },
   "license": "MIT",
   "author": "Profullstack, LLC",
   "exports": {
-    ".": { "types": "./index.d.ts", "import": "./src/index.js" }
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./src/index.js"
+    }
   },
-  "bin": { "scraper-daemon": "bin/scraper-daemon.js" },
-  "files": ["src", "bin", "index.d.ts", "README.md", "LICENSE"],
-  "engines": { "node": ">=20" },
-  "scripts": { "test": "node --test" }
+  "bin": {
+    "scraper-daemon": "bin/scraper-daemon.js"
+  },
+  "files": [
+    "src",
+    "bin",
+    "index.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "bullmq": "6.3.17",
+    "ioredis": "5"
+  },
+  "peerDependencies": {
+    "bullmq": ">=6",
+    "ioredis": ">=5"
+  },
+  "peerDependenciesMeta": {
+    "bullmq": {
+      "optional": true
+    },
+    "ioredis": {
+      "optional": true
+    }
+  }
 }

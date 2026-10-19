@@ -38,7 +38,7 @@ jobs:
         run: |
           VERSION="$(node -p "require('./package.json').version")"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "@profullstack/webhooks@$VERSION"
+          echo "@profullstack/scraper-daemon@$VERSION"
 
       - name: Check the tag matches package.json
         if: github.event_name == 'release'
@@ -56,9 +56,9 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          if npm view "@profullstack/webhooks@$VERSION" version >/dev/null 2>&1; then
+          if npm view "@profullstack/scraper-daemon@$VERSION" version >/dev/null 2>&1; then
             echo "already=true" >> "$GITHUB_OUTPUT"
-            echo "@profullstack/webhooks@$VERSION is already published, nothing to do"
+            echo "@profullstack/scraper-daemon@$VERSION is already published, nothing to do"
           else
             echo "already=false" >> "$GITHUB_OUTPUT"
           fi
@@ -87,10 +87,10 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           for _ in $(seq 1 30); do
-            if [ "$(npm view "@profullstack/webhooks@$VERSION" version 2>/dev/null)" = "$VERSION" ]; then
-              echo "@profullstack/webhooks@$VERSION is on the registry"
+            if [ "$(npm view "@profullstack/scraper-daemon@$VERSION" version 2>/dev/null)" = "$VERSION" ]; then
+              echo "@profullstack/scraper-daemon@$VERSION is on the registry"
               exit 0
             fi
             sleep 20
           done
-          echo "::warning::published, but reads do not report @profullstack/webhooks@$VERSION yet (new-name 404 window?)"
+          echo "::warning::published, but reads do not report @profullstack/scraper-daemon@$VERSION yet (new-name 404 window?)"

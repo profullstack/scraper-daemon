@@ -1,6 +1,6 @@
 {
   "name": "@profullstack/scraper-daemon",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "One updater daemon for every listing site: periodic jobs, per-item refresh queues and resumable bulk pipelines, with polite, SSRF-safe fetching, robots.txt, per-host serial crawling, 429 hold-back, error ladders and SQLite/Postgres state. Zero dependencies.",
   "keywords": ["scraper", "crawler", "daemon", "scheduler", "robots.txt", "ssrf", "polite", "bun", "sqlite", "postgres"],

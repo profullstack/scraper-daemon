@@ -48,6 +48,8 @@ export function createDaemon({
   redis = null,
   queueName,
   onRedisDown,
+  // How often the watchdog pings Redis; three misses in a row and the process exits (or onRedisDown runs).
+  redisCheckMs = 30_000,
   store: storeOption,
   concurrency = 4,
   tickMs = 5_000,
@@ -120,19 +122,63 @@ export function createDaemon({
   }
 
   let conn = null;
-  async function connection() {
-    if (conn) return conn;
-    if (typeof redis !== 'string') return (conn = redis);
-    const { default: IORedis } = await import('ioredis');
-    // BullMQ requires maxRetriesPerRequest: null; the watchdog covers the hang that causes.
-    conn = new IORedis(redis, { maxRetriesPerRequest: null, enableReadyCheck: true, connectionName: `${name}-scraper-daemon` });
-    ownRedis = conn;
-    return conn;
+  let connecting = null;
+  /** The one connection. Memoised as a promise: two callers racing the import must not each make a client. */
+  function connection() {
+    if (conn) return Promise.resolve(conn);
+    if (typeof redis !== 'string') return Promise.resolve((conn = redis));
+    connecting ??= import('ioredis').then(({ default: IORedis }) => {
+      // BullMQ requires maxRetriesPerRequest: null; the watchdog covers the hang that causes.
+      conn = new IORedis(redis, { maxRetriesPerRequest: null, enableReadyCheck: true, connectionName: `${name}-scraper-daemon` });
+      ownRedis = conn;
+      connecting = null;
+      return conn;
+    });
+    return connecting;
   }
 
   async function startBullmq() {
     const { Queue, Worker } = await import('bullmq');
     const client = await connection();
+
+    // Armed before anything waits on Redis: a Redis that is down at boot makes the first
+    // awaited command hang (maxRetriesPerRequest: null), and this is what notices.
+    let misses = 0;
+    const watchdog = setInterval(async () => {
+      const pong = await withTimeout(client.ping().catch(() => null), Math.min(5_000, redisCheckMs), null);
+      if (pong === 'PONG') {
+        misses = 0;
+        return;
+      }
+      misses++;
+      log(`redis did not answer (${misses} in a row)`);
+      if (misses >= 3) {
+        clearInterval(watchdog);
+        if (onRedisDown) onRedisDown();
+        else {
+          log('redis unreachable for 3 checks: exiting so the supervisor restarts with a fresh connection');
+          process.exit(1);
+        }
+      }
+    }, redisCheckMs);
+    watchdog.unref?.();
+    client.on?.('error', (err) => {
+      if (misses === 0) log(`redis: ${err?.message ?? err}`);
+    });
+
+    // No Queue or Worker until Redis answers: a Worker made against a dead Redis starts
+    // timers only a completed close() clears, and close() cannot complete without Redis.
+    while ((await withTimeout(client.ping().catch(() => null), 5_000, null)) !== 'PONG') {
+      if (controller.signal.aborted) {
+        clearInterval(watchdog);
+        if (ownRedis) ownRedis.disconnect();
+        conn = null;
+        ownRedis = null;
+        return;
+      }
+      await new Promise((r) => setTimeout(r, Math.min(1_000, redisCheckMs)));
+    }
+
     await storeReady();
     const qname = (queueName ?? name).replace(/[^A-Za-z0-9._-]/g, '-');
     // Events streams carry every job's return value; ours return nothing, and the cap keeps it that way.
@@ -142,27 +188,6 @@ export function createDaemon({
     const workerConn = client.duplicate();
     const worker = new Worker(qname, (job) => processJob(job), { connection: workerConn, concurrency: concurrency + 1, streams, lockDuration: 60_000 });
     worker.on('error', (err) => log(`worker error: ${err?.message ?? err}`));
-    // One tick at a time across every process: BullMQ fires it, the Worker runs it.
-    await queue.upsertJobScheduler(TICK, { every: tickMs }, { name: TICK, data: {}, opts: { removeOnComplete: true, removeOnFail: true } });
-
-    let misses = 0;
-    const watchdog = setInterval(async () => {
-      const pong = await withTimeout(client.ping().catch(() => null), 5_000, null);
-      if (pong === 'PONG') {
-        misses = 0;
-        return;
-      }
-      misses++;
-      log(`redis did not answer (${misses} in a row)`);
-      if (misses >= 3) {
-        if (onRedisDown) onRedisDown();
-        else {
-          log('redis unreachable for 3 checks: exiting so the supervisor restarts with a fresh connection');
-          process.exit(1);
-        }
-      }
-    }, 30_000);
-    watchdog.unref?.();
 
     engine = {
       enqueue: (t, key) => queue.add(t.name, { key }, { jobId: jobIdFor(t.name, key) }),
@@ -176,7 +201,20 @@ export function createDaemon({
         conn = null;
         ownRedis = null;
       },
+      /** After a graceful close that could not finish (Redis down): drop the sockets, stop reconnecting. */
+      kill() {
+        clearInterval(watchdog);
+        // BullMQ's own clients (the Worker's blocking connection is a duplicate it made) first.
+        Promise.resolve(worker.disconnect?.()).catch(() => {});
+        Promise.resolve(queue.disconnect?.()).catch(() => {});
+        workerConn.disconnect();
+        ownRedis?.disconnect();
+        conn = null;
+        ownRedis = null;
+      },
     };
+    // One tick at a time across every process: BullMQ fires it, the Worker runs it.
+    await queue.upsertJobScheduler(TICK, { every: tickMs }, { name: TICK, data: {}, opts: { removeOnComplete: true, removeOnFail: true } });
     log(`started (bullmq queue ${qname}): ${tasks.map((t) => `${t.kind} ${t.name}`).join(', ')}`);
   }
 
@@ -476,8 +514,14 @@ export function createDaemon({
       stopping ??= (async () => {
         controller.abort();
         if (engine) {
-          await withTimeout(engine.close(), graceMs, null).catch(() => {});
+          const closed = await withTimeout(engine.close().then(() => true), graceMs, false).catch(() => false);
+          if (!closed) engine.kill();
           engine = null;
+        } else if (ownRedis) {
+          // Still waiting for Redis to answer: drop the connection now so ioredis stops reconnecting.
+          ownRedis.disconnect();
+          conn = null;
+          ownRedis = null;
         }
         const until = now() + graceMs;
         while (active > 0 && now() < until) await new Promise((r) => setTimeout(r, 50));
@@ -511,9 +555,21 @@ export function createDaemon({
 
     /** Everything a status page needs, as plain JSON. */
     async status() {
+      // A status page must answer even when the store cannot: ioredis waits forever on a
+      // refused connection, so every store read here is bounded, and what is cached is shown.
+      let storeAnswered = true;
+      const bounded = async (p, fallback) => {
+        const miss = Symbol('miss');
+        const v = await withTimeout(p, 2000, miss).catch(() => miss);
+        if (v === miss) {
+          storeAnswered = false;
+          return fallback;
+        }
+        return v;
+      };
       const out = [];
       for (const t of tasks) {
-        const r = await runs(t);
+        const r = await bounded(runs(t), t.runs ?? new Map());
         const recs = [...r.values()];
         const base = { name: t.name, kind: t.kind, every: t.every, running: t.running.size, ok: t.ok, failed: t.failed, lastOk: t.lastOk ?? recs.reduce((m, x) => Math.max(m, x.lastOk ?? 0), 0) ?? null, lastError: t.lastError, stalled: t.stalled };
         if (t.kind === 'queue') {
@@ -532,18 +588,20 @@ export function createDaemon({
           out.push({ ...base, items: items.size, due: due + never, neverRun: never, failing, retired });
         } else {
           const x = r.get('*');
-          out.push({ ...base, nextAt: x?.nextAt ?? null, fails: x?.fails ?? 0, progress: t.kind === 'pipeline' ? await (await storeReady()).get(`${t.name}:progress`) : undefined });
+          out.push({ ...base, nextAt: x?.nextAt ?? null, fails: x?.fails ?? 0, progress: t.kind === 'pipeline' ? await bounded((async () => (await storeReady()).get(`${t.name}:progress`))(), null) : undefined });
         }
       }
       return {
         name,
-        engine: engine ? 'bullmq' : 'local',
-        queue: engine ? await withTimeout(engine.counts(), 3000, { error: 'redis did not answer in 3 s' }) : undefined,
+        engine: redis ? 'bullmq' : 'local',
+        queue: engine ? await withTimeout(engine.counts(), 3000, { error: 'redis did not answer in 3 s' }) : redis ? { error: 'connecting to redis' } : undefined,
         running: Boolean(timer) || Boolean(engine),
         startedAt: started,
         active,
         concurrency,
-        store: (await storeReady()).kind ?? 'custom',
+        store: store?.kind ?? (redis ? 'redis' : 'custom'),
+        // false when the store did not answer within 2 s (Redis down): the numbers above are the last ones seen.
+        storeAnswered,
         heldHosts: [...heldHosts].filter(([, until]) => until > now()).map(([host, until]) => ({ host, until })),
         tasks: out,
         recent: history.slice(-20).reverse(),

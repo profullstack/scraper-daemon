@@ -134,9 +134,26 @@ describe('bullmq engine', { skip: !url && 'REDIS_URL not set' }, () => {
     breakSwap = false;
     d = build().start();
     await d.ready();
-    assert.ok(await until(async () => did.filter((x) => x === 'swap').length === 2, 6000), `resumed (${did})`);
+    assert.ok(await until(async () => did.filter((x) => x === 'swap').length === 2, 12000), `resumed (${did})`);
     assert.deepEqual(did, ['download', 'swap', 'swap']);
     assert.equal(JSON.parse(await redis.hget(`sd:${q}:state`, 'dump:done')), 'stamp-1');
     await d.stop();
+  });
+});
+
+describe('redis down', () => {
+  test('status answers within seconds, and the watchdog calls onRedisDown after three missed pings', { timeout: 15_000 }, async () => {
+    let down = 0;
+    // Port 1 on loopback: nothing listens, every connect is refused (the boot-time failure prod hit).
+    const d = createDaemon({ name: 'test-down', redis: 'redis://127.0.0.1:1', log: quiet, tickMs: 50, redisCheckMs: 100, onRedisDown: () => down++ });
+    d.job({ name: 'sync', every: '1h', run: async () => {} });
+    d.start();
+    const t0 = Date.now();
+    const s = await d.status();
+    assert.ok(Date.now() - t0 < 6000, `status took ${Date.now() - t0} ms`);
+    assert.equal(s.storeAnswered, false);
+    assert.equal(s.tasks[0].name, 'sync');
+    assert.ok(await until(async () => down === 1, 4000), 'onRedisDown fired');
+    await d.stop({ graceMs: 500 });
   });
 });

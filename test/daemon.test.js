@@ -236,3 +236,21 @@ describe('stores', () => {
     });
   }
 });
+
+describe('process lifetime', () => {
+  test('a started daemon keeps a process alive on its own; stop lets it exit', async () => {
+    const { spawn } = await import('node:child_process');
+    const script = `import { createDaemon } from ${JSON.stringify(new URL('../src/index.js', import.meta.url).href)};
+      let n = 0;
+      const d = createDaemon({ log: () => {}, tickMs: 20 });
+      d.job({ name: 'tick', every: 30, run: async () => { n++; } });
+      d.start();
+      setTimeout(async () => { console.log('ran', n > 1); await d.stop(); }, 300);`;
+    const child = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: ['ignore', 'pipe', 'inherit'] });
+    let out = '';
+    child.stdout.on('data', (b) => (out += b));
+    const code = await new Promise((resolve) => child.on('exit', resolve));
+    assert.equal(out.trim(), 'ran true');
+    assert.equal(code, 0);
+  });
+});

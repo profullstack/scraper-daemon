@@ -460,8 +460,8 @@ export function createDaemon({
       }
       log(`started (local engine): ${tasks.map((t) => `${t.kind} ${t.name}`).join(', ')}`);
       const loop = () => tick().catch((err) => log(`tick failed: ${err?.message ?? err}`));
+      // A daemon is what keeps its process alive (a poller has no server to do it): never unref this timer.
       timer = setInterval(loop, tickMs);
-      timer.unref?.();
       loop();
       return api;
     },

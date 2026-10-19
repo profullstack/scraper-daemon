@@ -99,6 +99,17 @@ export function pgStore(query, { prefix = 'scraper_daemon' } = {}) {
     (ready ??= (async () => {
       await rows(`CREATE TABLE IF NOT EXISTS ${runs} (job text NOT NULL, key text NOT NULL, last_try bigint, last_ok bigint, next_at bigint, fails integer NOT NULL DEFAULT 0, last_error text, PRIMARY KEY (job, key))`, []);
       await rows(`CREATE TABLE IF NOT EXISTS ${kv} (key text PRIMARY KEY, value jsonb NOT NULL)`, []);
+      // 0.1.0 wrote state double-encoded through Bun's SQL (a jsonb string holding JSON text). Unwrap those once.
+      for (const r of await rows(`SELECT key, value #>> '{}' AS inner FROM ${kv} WHERE jsonb_typeof(value) = 'string'`, [])) {
+        const inner = String(r.inner ?? '');
+        if (!/^[[{"]/.test(inner)) continue;
+        try {
+          JSON.parse(inner);
+        } catch {
+          continue;
+        }
+        await rows(`UPDATE ${kv} SET value = $2::text::jsonb WHERE key = $1`, [r.key, inner]);
+      }
     })());
   return {
     kind: 'postgres',
@@ -118,15 +129,16 @@ export function pgStore(query, { prefix = 'scraper_daemon' } = {}) {
       await init();
       if (keys.length) await rows(`DELETE FROM ${runs} WHERE job = $1 AND key = ANY($2::text[])`, [job, `{${keys.map((k) => `"${String(k).replace(/["\\]/g, '\\$&')}"`).join(',')}}`]);
     },
+    // Values cross the driver as JSON text both ways (`$2::text::jsonb` in, `value::text` out): drivers
+    // disagree on how they encode a jsonb parameter and decode a jsonb column, and text means the same to all.
     async get(key) {
       await init();
-      const [row] = await rows(`SELECT value FROM ${kv} WHERE key = $1`, [key]);
-      if (!row) return null;
-      return typeof row.value === 'string' ? JSON.parse(row.value) : row.value;
+      const [row] = await rows(`SELECT value::text AS value FROM ${kv} WHERE key = $1`, [key]);
+      return row ? JSON.parse(row.value) : null;
     },
     async set(key, value) {
       await init();
-      await rows(`INSERT INTO ${kv} (key, value) VALUES ($1, $2::jsonb) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [key, JSON.stringify(value)]);
+      await rows(`INSERT INTO ${kv} (key, value) VALUES ($1, $2::text::jsonb) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [key, JSON.stringify(value ?? null)]);
     },
   };
 }

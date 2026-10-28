@@ -1,6 +1,6 @@
 {
   "name": "@profullstack/scraper-daemon",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "description": "One updater daemon for every listing site, on BullMQ: periodic jobs, per-item refresh queues and resumable bulk pipelines, with polite, SSRF-safe fetching, robots.txt, per-host serial crawling, 429 hold-back and error ladders. Each app keeps its data where it wants; the daemon keeps its queue and run state in Redis.",
   "keywords": [

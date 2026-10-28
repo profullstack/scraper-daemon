@@ -29,6 +29,9 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
 
+      # bullmq + ioredis are dev dependencies; without them the redis-down test cannot start the engine.
+      - run: npm install --no-audit --no-fund
+
       - run: node --test
         env:
           CI: true

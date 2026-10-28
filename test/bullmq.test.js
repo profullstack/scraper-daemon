@@ -76,6 +76,30 @@ describe('bullmq engine', { skip: !url && 'REDIS_URL not set' }, () => {
     await d.stop();
   });
 
+  test('a failed job left under a task id does not block that task', async () => {
+    const q = qname('stale');
+    const { Queue, Worker } = await import('bullmq');
+    // What 0.2.1 left behind when Postgres went into recovery: sync--* in the failed set.
+    const conns = [redis.duplicate(), redis.duplicate()];
+    const seed = new Queue(q, { connection: conns[0] });
+    await seed.add('sync', { key: '*' }, { jobId: jobIdFor('sync', '*'), removeOnFail: { count: 200 } });
+    const breaker = new Worker(q, async () => { throw new Error('the database system is in recovery mode'); }, { connection: conns[1] });
+    assert.ok(await until(async () => (await redis.zcard(`bull:${q}:failed`)) === 1), 'seeded a failed job');
+    await breaker.close();
+    await seed.close();
+    // BullMQ does not close a connection it was handed.
+    for (const c of conns) await c.quit();
+
+    let runs = 0;
+    const d = createDaemon({ name: 'test', queueName: q, redis: url, log: quiet, tickMs: 50 });
+    d.job({ name: 'sync', every: '1h', run: async () => { runs++; } });
+    d.start();
+    await d.ready();
+    assert.ok(await until(async () => runs === 1), 'job ran despite the stale failed record');
+    assert.equal(await redis.zcard(`bull:${q}:failed`), 0);
+    await d.stop();
+  });
+
   test('a queue runs every item, one per host at a time, and failures climb the ladder', async () => {
     const q = qname('queue');
     const items = [

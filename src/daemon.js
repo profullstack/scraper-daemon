@@ -183,14 +183,22 @@ export function createDaemon({
     const qname = (queueName ?? name).replace(/[^A-Za-z0-9._-]/g, '-');
     // Events streams carry every job's return value; ours return nothing, and the cap keeps it that way.
     const streams = { events: { maxLen: 100 } };
-    const queue = new Queue(qname, { connection: client, streams, defaultJobOptions: { removeOnComplete: true, removeOnFail: { count: 200 }, attempts: 1 } });
+    // Job ids are fixed per task and key, and BullMQ silently ignores an add whose id it still holds,
+    // so a kept failed job would block that task forever: drop failures too (runs() keeps the error).
+    const queue = new Queue(qname, { connection: client, streams, defaultJobOptions: { removeOnComplete: true, removeOnFail: true, attempts: 1 } });
     // The Worker blocks on its own connection; BullMQ does not close a connection it was handed, so close() does.
     const workerConn = client.duplicate();
     const worker = new Worker(qname, (job) => processJob(job), { connection: workerConn, concurrency: concurrency + 1, streams, lockDuration: 60_000 });
     worker.on('error', (err) => log(`worker error: ${err?.message ?? err}`));
 
     engine = {
-      enqueue: (t, key) => queue.add(t.name, { key }, { jobId: jobIdFor(t.name, key) }),
+      async enqueue(t, key) {
+        const jobId = jobIdFor(t.name, key);
+        // A finished job left under this id (one kept by 0.2.1, say) would swallow the add.
+        const old = await queue.getJob(jobId);
+        if (old && ['failed', 'completed'].includes(await old.getState())) await old.remove().catch(() => {});
+        return queue.add(t.name, { key }, { jobId });
+      },
       counts: () => queue.getJobCounts('active', 'waiting', 'delayed', 'failed'),
       async close() {
         clearInterval(watchdog);

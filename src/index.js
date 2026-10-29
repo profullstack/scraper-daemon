@@ -1,6 +1,7 @@
 export { createDaemon, jobIdFor, withTimeout } from './daemon.js';
 export { redisStore } from './redis-store.js';
 export { ms } from './duration.js';
+export { CADENCE_DEFAULTS, DAY, DEFAULT_SHARES, HOUR, planNext, planUndated, publishTimes, quotas, tierFor, tierSql, TIERS, WEEK } from './cadence.js';
 export { createFetcher, FetchError, isPublicAddress, retryAfter } from './fetch.js';
 export { hostGate } from './gate.js';
 export { robotsAllows } from './robots.js';

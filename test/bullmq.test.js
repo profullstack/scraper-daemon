@@ -181,3 +181,29 @@ describe('redis down', () => {
     await d.stop({ graceMs: 500 });
   });
 });
+
+describe('feeds on BullMQ', { skip: !url }, () => {
+  test('due feeds become prioritised jobs carrying their row, and save sees the plan', async () => {
+    const queueName = qname('feeds');
+    const saved = [];
+    const rows = [
+      { id: 'a', url: 'https://a.example/feed', tier: 'hot', dates: [new Date(Date.now() - 600_000).toISOString(), new Date(Date.now() - 2_400_000).toISOString()] },
+      { id: 'b', url: 'https://b.example/feed', tier: 'slow', dates: [] },
+    ];
+    const d = createDaemon({ name: 'feeds-test', queueName, redis: url, log: quiet, tickMs: 200, concurrency: 4 });
+    d.feeds({
+      name: 'crawl',
+      due: async (tier) => rows.filter((r) => r.tier === tier && !saved.some((s) => s.feed.id === r.id)),
+      run: async (feed) => ({ dates: feed.dates, changed: true }),
+      save: async (feed, plan) => void saved.push({ feed, plan }),
+    });
+    d.start();
+    await d.ready();
+    assert.ok(await until(() => saved.length === 2));
+    await d.stop();
+    const a = saved.find((s) => s.feed.id === 'a');
+    assert.equal(a.feed.url, 'https://a.example/feed');
+    assert.equal(a.plan.tier, 'hot');
+    assert.equal(saved.find((s) => s.feed.id === 'b').plan.reason, 'undated-changed');
+  });
+});

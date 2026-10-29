@@ -88,6 +88,34 @@ process.on('SIGTERM', () => daemon.stop().then(() => process.exit(0)));
 - **Reporting.** `daemon.status()` (tasks, due counts, failing and retired items, held hosts, the last 20 runs) for `/api/v1/daemon` and `/health`; `onRun(entry)` for a site's own run log; `onStall` when a task has not succeeded within `staleAfter`.
 - **CLI.** `npx @profullstack/scraper-daemon status https://site` prints what a site's daemon is doing.
 
+## Feeds: adaptive, tiered crawls over a directory
+
+For a directory of feeds (hundreds of thousands of rows), `daemon.feeds()` keeps the schedule in **your** database and the policy here. Nothing per feed is stored in Redis; only in-flight jobs are.
+
+```js
+import { createDaemon, tierSql } from '@profullstack/scraper-daemon';
+
+daemon.feeds({
+  name: 'crawl',
+  concurrency: 32,
+  // One indexed read per tier: `${tierSql('interval_minutes')} = $tier and next_at <= now() order by next_at limit $n`
+  due: (tier, limit) => db.dueFeeds(tier, limit),
+  run: async (feed, ctx) => {
+    const doc = await ctx.fetch.text(feed.url);
+    const items = parse(doc.text);
+    await db.storeItems(feed.id, items);
+    return { dates: items.map((i) => i.published), changed: items.length > 0 };
+  },
+  save: (feed, plan) => db.schedule(feed.id, { nextAt: plan.nextAt, minutes: plan.minutes, archived: plan.archived }),
+  fail: (feed, f) => db.failed(feed.id, { nextAt: f.nextAt, fails: f.fails, error: f.error, held: f.held }),
+});
+```
+
+- **Cadence** (`@profullstack/scraper-daemon/cadence`, pure): from a feed's publish dates, `planNext()` picks the next read between **15 minutes** (a feed posting every hour) and **one week**. Between posts a feed is read four times per rhythm but never sleeps past the point its next post is due; inside that window it is read 24 times per rhythm (at least every 6 h), so a weekly show is checked every few hours around its release day instead of every 3.5 days. A feed silent for 3 rhythms backs off on its silence. **Silent 180 days and it is archived**: kept, out of the queue, looked at once every 90 days in case it came back. Undated feeds use `planUndated()` (halve on change, double on none, within a day). Every threshold is an option.
+- **Tiers**: `hot` (≤ 1 h), `active` (≤ 1 d), `slow` (< 7 d), `dormant` (7 d, gone quiet), `archived`. The tier is derived from the interval alone (`tierFor`, and `tierSql()` for the same thing in SQL), so a site needs no new column, only an expression index.
+- **Dispatch**: each tick splits the free slots by tier (`shares`, default 40/30/18/10/2), asks `due()` per tier, hands unused slots down and then back up. Under load the quiet tiers lag, never the live ones; with room to spare everything due is read. One feed per host at a time (`perHost`), a 429 holds the whole host and does not count against the feed, failures climb the error ladder from the feed's own `fails`.
+- **BullMQ**: each feed is a job carrying its row, priority = tier, so a backed-up queue still drains hot feeds first. `daemon.runNow('crawl', row)` reads one feed at once (a refresh button).
+
 ## Adopting it on a site that already has a loop
 
 Wrap, do not rewrite: a mature crawler (its own due-row selection, cadence and per-host spreading) becomes one `job` whose `run` calls the existing function, and gains the shared status, stall alerts and run log. New work (contact enrichment, discovery sources) goes in as `queue`s and `job`s beside it.

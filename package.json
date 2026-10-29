@@ -1,8 +1,8 @@
 {
   "name": "@profullstack/scraper-daemon",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "type": "module",
-  "description": "One updater daemon for every listing site, on BullMQ: periodic jobs, per-item refresh queues and resumable bulk pipelines, with polite, SSRF-safe fetching, robots.txt, per-host serial crawling, 429 hold-back and error ladders. Each app keeps its data where it wants; the daemon keeps its queue and run state in Redis.",
+  "description": "One updater daemon for every listing site, on BullMQ: periodic jobs, per-item refresh queues, tiered adaptive feed crawls and resumable bulk pipelines, with polite, SSRF-safe fetching, robots.txt, per-host serial crawling, 429 hold-back and error ladders. Each app keeps its data where it wants; the daemon keeps its queue and run state in Redis.",
   "keywords": [
     "bullmq",
     "bun",
@@ -32,6 +32,10 @@
     ".": {
       "types": "./index.d.ts",
       "import": "./src/index.js"
+    },
+    "./cadence": {
+      "types": "./index.d.ts",
+      "import": "./src/cadence.js"
     }
   },
   "bin": {

@@ -2,6 +2,7 @@ import { ms } from './duration.js';
 import { createFetcher, FetchError } from './fetch.js';
 import { hostGate } from './gate.js';
 import { memoryStore } from './store.js';
+import { DEFAULT_SHARES, planNext, planUndated, quotas, tierFor, TIERS } from './cadence.js';
 
 /**
  * One long-running process per site that keeps its listings fresh. Three kinds of work:
@@ -22,6 +23,13 @@ import { memoryStore } from './store.js';
  *     A bulk import: `gate` says whether there is anything new (a HEAD stamp), the
  *     steps run in order, and a run that dies part way resumes from the step that
  *     failed instead of starting over.
+ *
+ *   daemon.feeds({ name, due(tier, limit, ctx), run(feed, ctx), save(feed, plan, result, ctx), fail(feed, failure, ctx) })
+ *     A crawl over hundreds of thousands of feeds whose schedule lives in the site's
+ *     own database, not here. Every tick asks `due` for each tier in turn (hot, active,
+ *     slow, dormant, archived) with a share of the free slots, so live feeds are read
+ *     first and archived ones only trickle; `run` returns the publish dates it saw and
+ *     the cadence module turns them into the next read, which `save` writes back.
  *
  * A 429 (or a FetchError carrying retryAfterMs) holds the whole host back, not just
  * the item, and does not count as the item failing. status() is what /health and
@@ -90,7 +98,10 @@ export function createDaemon({
       ladder: spec.backoff ?? DEFAULT_LADDER,
       retireAfter: spec.retireAfter ?? null,
       staleAfter: spec.staleAfter ? ms(spec.staleAfter) : null,
-      concurrency: spec.concurrency ?? (kind === 'queue' ? 2 : 1),
+      concurrency: spec.concurrency ?? (kind === 'queue' ? 2 : kind === 'feeds' ? 16 : 1),
+      perHost: spec.perHost ?? 1,
+      inflight: new Map(),
+      byTier: Object.fromEntries(TIERS.map((x) => [x, { ok: 0, failed: 0 }])),
       itemsEvery: ms(spec.itemsEvery ?? '10m'),
       spec,
       runs: null,
@@ -192,12 +203,15 @@ export function createDaemon({
     worker.on('error', (err) => log(`worker error: ${err?.message ?? err}`));
 
     engine = {
-      async enqueue(t, key) {
+      async enqueue(t, key, extra = {}) {
         const jobId = jobIdFor(t.name, key);
         // A finished job left under this id (one kept by 0.2.1, say) would swallow the add.
         const old = await queue.getJob(jobId);
         if (old && ['failed', 'completed'].includes(await old.getState())) await old.remove().catch(() => {});
-        return queue.add(t.name, { key }, { jobId });
+        // A feed travels with its job (the site's row, not a key to look up again); its tier
+        // is the BullMQ priority, so a backed-up queue still drains hot feeds first.
+        const priority = extra.tier ? TIERS.indexOf(extra.tier) + 1 : undefined;
+        return queue.add(t.name, { key, ...extra }, { jobId, ...(priority ? { priority } : {}) });
       },
       counts: () => queue.getJobCounts('active', 'waiting', 'delayed', 'failed'),
       async close() {
@@ -391,6 +405,135 @@ export function createDaemon({
     });
   }
 
+  /* ---------- feeds: the schedule is the site's, the policy is cadence.js ---------- */
+
+  const feedKey = (t, feed) => String(t.spec.key ? t.spec.key(feed) : (feed.key ?? feed.id));
+
+  async function dueFeeds(t, room) {
+    const ctx = ctxFor(t, null, controller.signal);
+    const perHost = new Map();
+    for (const { host } of t.inflight.values()) if (host) perHost.set(host, (perHost.get(host) ?? 0) + 1);
+    const picked = [];
+    const seen = new Set();
+    const exhausted = new Set();
+    const take = async (tier, want) => {
+      // Over-read: rows already in flight, on a busy host or a held one are skipped here.
+      const rows = (await t.spec.due(tier, want * 3 + t.running.size + picked.length, ctx)) ?? [];
+      let got = 0;
+      for (const feed of rows) {
+        if (got >= want) break;
+        const key = feedKey(t, feed);
+        if (t.running.has(key) || seen.has(key)) continue;
+        const host = hostOf(t, feed);
+        if (held(host)) continue;
+        if (host && (perHost.get(host) ?? 0) >= t.perHost) continue;
+        if (host) perHost.set(host, (perHost.get(host) ?? 0) + 1);
+        seen.add(key);
+        picked.push({ key, feed, host, tier });
+        got++;
+      }
+      if (got < want) exhausted.add(tier);
+      return got;
+    };
+    let carry = 0;
+    for (const [tier, quota] of quotas(room, t.spec.shares ?? DEFAULT_SHARES)) {
+      const want = quota + carry;
+      // Slots a tier had nothing due for go to the next one down.
+      carry = want > 0 ? want - (await take(tier, want)) : 0;
+    }
+    // Still room once every tier had its share: back up from the hottest tier that has more.
+    for (const tier of TIERS) {
+      if (carry <= 0) break;
+      if (!exhausted.has(tier)) carry -= await take(tier, carry);
+    }
+    return picked;
+  }
+
+  /** The next read, from what the crawl saw: its own nextIn, the dates, or the undated ladder. */
+  function decide(t, feed, result) {
+    const opts = { ...(t.spec.cadence ?? {}), now: now() };
+    let plan;
+    if (result.nextIn !== undefined) {
+      const minutes = Math.max(1, Math.round(ms(result.nextIn) / 60_000));
+      plan = { minutes, tier: tierFor(minutes, opts), archived: tierFor(minutes, opts) === 'archived', rhythm: null, silence: null, reason: 'nextIn' };
+    } else {
+      plan = planNext(result.dates ?? [], opts) ?? planUndated({ changed: Boolean(result.changed), previous: t.spec.previous ? t.spec.previous(feed) : feed.minutes }, opts);
+    }
+    return { ...plan, nextAt: now() + spread(plan.minutes * 60_000) };
+  }
+
+  async function runFeed(t, c) {
+    const started = now();
+    const ac = new AbortController();
+    const stopListener = () => ac.abort(new Error('daemon stopping'));
+    controller.signal.addEventListener('abort', stopListener, { once: true });
+    const timeout = setTimeout(() => ac.abort(new Error(`timed out after ${t.timeoutMs} ms`)), t.timeoutMs);
+    const ctx = ctxFor(t, c.key, ac.signal);
+    const tierStats = t.byTier[c.tier] ?? (t.byTier[c.tier] = { ok: 0, failed: 0 });
+    let outcome;
+    try {
+      const result = (await t.spec.run(c.feed, ctx)) ?? {};
+      const plan = decide(t, c.feed, result);
+      await t.spec.save(c.feed, plan, result, ctx);
+      t.ok++;
+      tierStats.ok++;
+      t.lastOk = now();
+      t.stalled = false;
+      outcome = { ok: true, result, plan };
+    } catch (err) {
+      const message = String(err?.message ?? err).slice(0, 500);
+      const retryAfter = err?.retryAfterMs ?? (err instanceof FetchError && err.status === 429 ? 30 * 60_000 : null);
+      let failure;
+      if (retryAfter !== null && c.host) {
+        // The host asked us to slow down: hold all of it, and do not count it against the feed.
+        holdHost(c.host, retryAfter);
+        failure = { error: message, held: true, fails: null, minutes: Math.ceil(ms(retryAfter) / 60_000), retire: false };
+      } else {
+        const fails = Number(t.spec.fails ? t.spec.fails(c.feed) : (c.feed.fails ?? 0)) + 1;
+        failure = { error: message, held: false, fails, minutes: Math.ceil(ladderAt(t.ladder, fails) / 60_000), retire: Boolean(t.retireAfter && fails >= t.retireAfter) };
+        t.failed++;
+        tierStats.failed++;
+        t.lastError = `${c.key}: ${message}`;
+      }
+      failure.nextAt = now() + failure.minutes * 60_000;
+      try {
+        await t.spec.fail?.(c.feed, failure, ctx);
+      } catch (e) {
+        log(`[${t.name} ${c.key}] could not record the failure: ${e?.message ?? e}`);
+      }
+      outcome = { ok: false, held: failure.held, retired: failure.retire, error: err };
+    } finally {
+      clearTimeout(timeout);
+      controller.signal.removeEventListener('abort', stopListener);
+    }
+    const entry = { job: t.name, kind: t.kind, key: c.key, tier: c.tier, ok: outcome.ok, held: !!outcome.held, retired: !!outcome.retired, ms: now() - started, at: started, error: outcome.error ? String(outcome.error?.message ?? outcome.error).slice(0, 500) : null };
+    history.push(entry);
+    if (history.length > 200) history.shift();
+    if (onRun) await Promise.resolve(onRun(entry, outcome.result)).catch((e) => log(`onRun hook failed: ${e.message}`));
+    return outcome;
+  }
+
+  function launchFeed(t, c) {
+    t.inflight.set(c.key, { host: c.host, tier: c.tier });
+    const settle = () => t.inflight.delete(c.key);
+    active++;
+    t.running.add(c.key);
+    if (engine) {
+      engine.enqueue(t, c.key, { feed: c.feed, tier: c.tier }).catch((err) => {
+        if (t.running.delete(c.key)) active--;
+        settle();
+        log(`[${t.name}] could not enqueue ${c.key}: ${err?.message ?? err}`);
+      });
+      return;
+    }
+    runFeed(t, c)
+      .finally(() => {
+        if (t.running.delete(c.key)) active--;
+        settle();
+      })
+      .catch(() => {});
+  }
+
   /* ---------- the loop ---------- */
 
   /**
@@ -429,6 +572,11 @@ export function createDaemon({
       active++;
     }
     try {
+      if (t.kind === 'feeds') {
+        const feed = job.data?.feed ?? { key };
+        await runFeed(t, { key, feed, host: hostOf(t, feed), tier: job.data?.tier ?? 'slow' });
+        return;
+      }
       await runs(t);
       if (t.kind === 'queue') {
         const items = await itemsOf(t);
@@ -436,6 +584,7 @@ export function createDaemon({
       } else await (t.kind === 'pipeline' ? runPipeline(t) : runJob(t));
     } finally {
       if (t.running.delete(key)) active--;
+      t.inflight.delete(key);
     }
   }
 
@@ -465,6 +614,11 @@ export function createDaemon({
       checkStall(t);
       if (active >= concurrency) continue;
       try {
+        if (t.kind === 'feeds') {
+          const room = Math.min(concurrency - active, t.concurrency - t.running.size);
+          if (room > 0) for (const c of await dueFeeds(t, room)) launchFeed(t, c);
+          continue;
+        }
         await runs(t);
         if (t.kind === 'queue') {
           const room = Math.min(concurrency - active, t.concurrency - t.running.size);
@@ -484,6 +638,10 @@ export function createDaemon({
     queue: (spec) => {
       if (typeof spec?.items !== 'function' || typeof spec?.run !== 'function') throw new TypeError('queue needs items() and run()');
       return define('queue', spec);
+    },
+    feeds: (spec) => {
+      for (const f of ['due', 'run', 'save']) if (typeof spec?.[f] !== 'function') throw new TypeError(`feeds needs ${f}()`);
+      return define('feeds', { every: '1h', timeout: '2m', ...spec });
     },
     pipeline: (spec) => {
       if (!Array.isArray(spec?.steps) || !spec.steps.length) throw new TypeError('pipeline needs steps');
@@ -537,10 +695,16 @@ export function createDaemon({
       return stopping;
     },
 
-    /** Run one task (or one queue item) now, whatever its schedule. Resolves with the outcome. */
+    /** Run one task (or one queue item, or one feed: pass the site's row) now, whatever its schedule. */
     async runNow(taskName, key) {
       const t = tasks.find((x) => x.name === taskName);
       if (!t) throw new Error(`no task ${taskName}`);
+      if (t.kind === 'feeds') {
+        if (!key || typeof key !== 'object') throw new TypeError('runNow on feeds takes the feed row');
+        const c = { key: feedKey(t, key), feed: key, host: hostOf(t, key), tier: key.tier ?? 'hot' };
+        if (t.running.has(c.key)) return { ok: false, busy: true };
+        return runFeed(t, c);
+      }
       await runs(t);
       if (t.kind === 'queue') {
         const items = await itemsOf(t);
@@ -580,6 +744,10 @@ export function createDaemon({
         const r = await bounded(runs(t), t.runs ?? new Map());
         const recs = [...r.values()];
         const base = { name: t.name, kind: t.kind, every: t.every, running: t.running.size, ok: t.ok, failed: t.failed, lastOk: t.lastOk ?? recs.reduce((m, x) => Math.max(m, x.lastOk ?? 0), 0) ?? null, lastError: t.lastError, stalled: t.stalled };
+        if (t.kind === 'feeds') {
+          out.push({ ...base, inflight: t.running.size, concurrency: t.concurrency, byTier: t.byTier });
+          continue;
+        }
         if (t.kind === 'queue') {
           const items = t.items ?? new Map();
           let due = 0;

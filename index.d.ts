@@ -65,6 +65,53 @@ export interface Item {
   [k: string]: unknown;
 }
 
+export type Tier = 'hot' | 'active' | 'slow' | 'dormant' | 'archived';
+
+export interface CadenceOptions {
+  floor?: number;
+  ceiling?: number;
+  archiveAfter?: number;
+  revisitEvery?: number;
+  quietMultiple?: number;
+  windowStart?: number;
+  windowReads?: number;
+  windowCeiling?: number;
+  idleReads?: number;
+  sample?: number;
+}
+
+export interface Plan {
+  /** Minutes until the next read. */
+  minutes: number;
+  tier: Tier;
+  archived: boolean;
+  /** Median minutes between posts, when there was a rhythm to read. */
+  rhythm: number | null;
+  silence: number | null;
+  reason: string;
+}
+
+export interface FeedRunResult {
+  /** The publish dates the document carried (any order, any parseable form). */
+  dates?: Array<string | number | Date | null | undefined>;
+  /** For an undated feed: whether its contents changed since the last read. */
+  changed?: boolean;
+  /** Override the cadence for this read. */
+  nextIn?: Duration;
+  [k: string]: unknown;
+}
+
+export interface FeedFailure {
+  error: string;
+  /** A 429: the host is held back and this read does not count against the feed. */
+  held: boolean;
+  fails: number | null;
+  minutes: number;
+  nextAt: number;
+  /** `retireAfter` failures in a row. */
+  retire: boolean;
+}
+
 export interface Daemon {
   job(spec: TaskOptions & { run(ctx: Ctx): Promise<RunResult | void> }): Daemon;
   queue<I extends Item = Item>(
@@ -82,11 +129,33 @@ export interface Daemon {
       steps: Array<{ name: string; run(ctx: Ctx & { token: string; step: string; results: Record<string, unknown> }): Promise<unknown> }>;
     },
   ): Daemon;
+  /** A crawl whose schedule lives in the site's database: tiered dispatch, cadence from publish dates. */
+  feeds<F extends Record<string, unknown> = Record<string, unknown>>(
+    spec: TaskOptions & {
+      /** Due feeds of one tier, oldest due first, at most `limit`. */
+      due(tier: Tier, limit: number, ctx: Ctx): Promise<F[]>;
+      run(feed: F, ctx: Ctx): Promise<FeedRunResult | void>;
+      /** Write the next read back: plan.nextAt (epoch ms), plan.minutes, plan.tier, plan.archived. */
+      save(feed: F, plan: Plan & { nextAt: number }, result: FeedRunResult, ctx: Ctx): Promise<void>;
+      fail?(feed: F, failure: FeedFailure, ctx: Ctx): Promise<void>;
+      key?(feed: F): string;
+      host?(feed: F): string | null;
+      /** The feed's current interval in minutes, for the undated ladder (default feed.minutes). */
+      previous?(feed: F): number | null;
+      /** Failures in a row so far (default feed.fails). */
+      fails?(feed: F): number;
+      shares?: Partial<Record<Tier, number>>;
+      cadence?: CadenceOptions;
+      perHost?: number;
+      retireAfter?: number;
+    },
+  ): Daemon;
   start(): Daemon;
   /** Resolves once the engine is connected (at once for the local engine). */
   ready(): Promise<void>;
   stop(opts?: { graceMs?: number }): Promise<void>;
-  runNow(task: string, key?: string): Promise<unknown>;
+  /** For a feeds task pass the feed row: one read now (a refresh button). */
+  runNow(task: string, key?: string | Record<string, unknown>): Promise<unknown>;
   refreshItems(task: string): void;
   status(): Promise<Record<string, unknown>>;
   holdHost(host: string, forMs: Duration): void;
@@ -164,3 +233,16 @@ export function memoryStore(): Store;
 export function sqliteStore(db: unknown, opts?: { prefix?: string }): Store;
 export function pgStore(query: (text: string, params: unknown[]) => Promise<unknown>, opts?: { prefix?: string }): Store;
 export function statusHandler(daemon: Daemon): (req?: Request) => Promise<Response>;
+
+export const HOUR: number;
+export const DAY: number;
+export const WEEK: number;
+export const TIERS: readonly Tier[];
+export const CADENCE_DEFAULTS: Readonly<Required<CadenceOptions>>;
+export const DEFAULT_SHARES: Readonly<Record<Tier, number>>;
+export function planNext(dates: Array<unknown>, opts?: CadenceOptions & { now?: number }): Plan | null;
+export function planUndated(input: { changed: boolean; previous?: number | null }, opts?: CadenceOptions): Plan;
+export function publishTimes(dates: Array<unknown>, now: number, opts?: { sample?: number }): number[];
+export function tierFor(minutes: number, opts?: { ceiling?: number }): Tier;
+export function tierSql(column?: string, opts?: { ceiling?: number }): string;
+export function quotas(room: number, shares?: Partial<Record<Tier, number>>): Array<[Tier, number]>;

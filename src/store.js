@@ -8,7 +8,9 @@
  *   sqliteStore(db)          bun:sqlite or better-sqlite3 (anything with .prepare/.exec)
  *   pgStore(query)           Postgres through any query(text, params) function
  *
- * Times are epoch milliseconds.
+ * Times are epoch milliseconds. `flag` is null, 'slow' or 'broken' (the target failed the
+ * fleet crawler rule and waits until next_at, 30 days out), or 'retired'; `flaggedAt` is
+ * when that was decided. Tables made by 0.3.x gain the two columns on first use.
  */
 
 const fromRow = (r) =>
@@ -19,6 +21,8 @@ const fromRow = (r) =>
     nextAt: r.next_at === null || r.next_at === undefined ? null : Number(r.next_at),
     fails: Number(r.fails ?? 0),
     lastError: r.last_error ?? null,
+    flag: r.flag ?? null,
+    flaggedAt: r.flagged_at === null || r.flagged_at === undefined ? null : Number(r.flagged_at),
   };
 
 export function memoryStore() {
@@ -31,7 +35,7 @@ export function memoryStore() {
     },
     async save(job, rec) {
       if (!runs.has(job)) runs.set(job, new Map());
-      runs.get(job).set(rec.key, { ...rec });
+      runs.get(job).set(rec.key, { flag: null, flaggedAt: null, ...rec });
     },
     async forget(job, keys) {
       for (const k of keys) runs.get(job)?.delete(k);
@@ -51,12 +55,16 @@ export function sqliteStore(db, { prefix = 'scraper_daemon' } = {}) {
   const kv = `${prefix}_state`;
   db.exec(`CREATE TABLE IF NOT EXISTS ${runs} (
     job TEXT NOT NULL, key TEXT NOT NULL, last_try INTEGER, last_ok INTEGER, next_at INTEGER,
-    fails INTEGER NOT NULL DEFAULT 0, last_error TEXT, PRIMARY KEY (job, key))`);
+    fails INTEGER NOT NULL DEFAULT 0, last_error TEXT, flag TEXT, flagged_at INTEGER, PRIMARY KEY (job, key))`);
   db.exec(`CREATE TABLE IF NOT EXISTS ${kv} (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+  // SQLite has no ADD COLUMN IF NOT EXISTS: add what a 0.3.x table lacks.
+  const have = new Set(db.prepare(`PRAGMA table_info(${runs})`).all().map((c) => c.name));
+  if (!have.has('flag')) db.exec(`ALTER TABLE ${runs} ADD COLUMN flag TEXT`);
+  if (!have.has('flagged_at')) db.exec(`ALTER TABLE ${runs} ADD COLUMN flagged_at INTEGER`);
   const q = {
-    load: db.prepare(`SELECT key, last_try, last_ok, next_at, fails, last_error FROM ${runs} WHERE job = ?`),
-    save: db.prepare(`INSERT INTO ${runs} (job, key, last_try, last_ok, next_at, fails, last_error) VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT (job, key) DO UPDATE SET last_try = excluded.last_try, last_ok = excluded.last_ok, next_at = excluded.next_at, fails = excluded.fails, last_error = excluded.last_error`),
+    load: db.prepare(`SELECT key, last_try, last_ok, next_at, fails, last_error, flag, flagged_at FROM ${runs} WHERE job = ?`),
+    save: db.prepare(`INSERT INTO ${runs} (job, key, last_try, last_ok, next_at, fails, last_error, flag, flagged_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (job, key) DO UPDATE SET last_try = excluded.last_try, last_ok = excluded.last_ok, next_at = excluded.next_at, fails = excluded.fails, last_error = excluded.last_error, flag = excluded.flag, flagged_at = excluded.flagged_at`),
     forget: db.prepare(`DELETE FROM ${runs} WHERE job = ? AND key = ?`),
     get: db.prepare(`SELECT value FROM ${kv} WHERE key = ?`),
     set: db.prepare(`INSERT INTO ${kv} (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value`),
@@ -67,7 +75,7 @@ export function sqliteStore(db, { prefix = 'scraper_daemon' } = {}) {
       return new Map(q.load.all(job).map((r) => [r.key, fromRow(r)]));
     },
     async save(job, r) {
-      q.save.run(job, r.key, r.lastTry, r.lastOk, r.nextAt, r.fails, r.lastError);
+      q.save.run(job, r.key, r.lastTry, r.lastOk, r.nextAt, r.fails, r.lastError, r.flag ?? null, r.flaggedAt ?? null);
     },
     async forget(job, keys) {
       for (const k of keys) q.forget.run(job, k);
@@ -97,7 +105,8 @@ export function pgStore(query, { prefix = 'scraper_daemon' } = {}) {
   let ready = null;
   const init = () =>
     (ready ??= (async () => {
-      await rows(`CREATE TABLE IF NOT EXISTS ${runs} (job text NOT NULL, key text NOT NULL, last_try bigint, last_ok bigint, next_at bigint, fails integer NOT NULL DEFAULT 0, last_error text, PRIMARY KEY (job, key))`, []);
+      await rows(`CREATE TABLE IF NOT EXISTS ${runs} (job text NOT NULL, key text NOT NULL, last_try bigint, last_ok bigint, next_at bigint, fails integer NOT NULL DEFAULT 0, last_error text, flag text, flagged_at bigint, PRIMARY KEY (job, key))`, []);
+      await rows(`ALTER TABLE ${runs} ADD COLUMN IF NOT EXISTS flag text, ADD COLUMN IF NOT EXISTS flagged_at bigint`, []);
       await rows(`CREATE TABLE IF NOT EXISTS ${kv} (key text PRIMARY KEY, value jsonb NOT NULL)`, []);
       // 0.1.0 wrote state double-encoded through Bun's SQL (a jsonb string holding JSON text). Unwrap those once.
       for (const r of await rows(`SELECT key, value #>> '{}' AS inner FROM ${kv} WHERE jsonb_typeof(value) = 'string'`, [])) {
@@ -115,14 +124,14 @@ export function pgStore(query, { prefix = 'scraper_daemon' } = {}) {
     kind: 'postgres',
     async load(job) {
       await init();
-      return new Map((await rows(`SELECT key, last_try, last_ok, next_at, fails, last_error FROM ${runs} WHERE job = $1`, [job])).map((r) => [r.key, fromRow(r)]));
+      return new Map((await rows(`SELECT key, last_try, last_ok, next_at, fails, last_error, flag, flagged_at FROM ${runs} WHERE job = $1`, [job])).map((r) => [r.key, fromRow(r)]));
     },
     async save(job, r) {
       await init();
       await rows(
-        `INSERT INTO ${runs} (job, key, last_try, last_ok, next_at, fails, last_error) VALUES ($1, $2, $3, $4, $5, $6, $7)
-         ON CONFLICT (job, key) DO UPDATE SET last_try = EXCLUDED.last_try, last_ok = EXCLUDED.last_ok, next_at = EXCLUDED.next_at, fails = EXCLUDED.fails, last_error = EXCLUDED.last_error`,
-        [job, r.key, r.lastTry, r.lastOk, r.nextAt, r.fails, r.lastError],
+        `INSERT INTO ${runs} (job, key, last_try, last_ok, next_at, fails, last_error, flag, flagged_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (job, key) DO UPDATE SET last_try = EXCLUDED.last_try, last_ok = EXCLUDED.last_ok, next_at = EXCLUDED.next_at, fails = EXCLUDED.fails, last_error = EXCLUDED.last_error, flag = EXCLUDED.flag, flagged_at = EXCLUDED.flagged_at`,
+        [job, r.key, r.lastTry, r.lastOk, r.nextAt, r.fails, r.lastError, r.flag ?? null, r.flaggedAt ?? null],
       );
     },
     async forget(job, keys) {

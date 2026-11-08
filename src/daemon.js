@@ -3,6 +3,7 @@ import { createFetcher, FetchError } from './fetch.js';
 import { hostGate } from './gate.js';
 import { memoryStore } from './store.js';
 import { DEFAULT_SHARES, planNext, planUndated, quotas, tierFor, TIERS } from './cadence.js';
+import { failureClass, flagPlan, FLAG_FOR_MS, RETIRE_RECHECK_MS } from './flag.js';
 
 /**
  * One long-running process per site that keeps its listings fresh. Three kinds of work:
@@ -17,7 +18,7 @@ import { DEFAULT_SHARES, planNext, planUndated, quotas, tierFor, TIERS } from '.
  *     adds is picked up without a restart. Items of one host run one after another;
  *     hosts run side by side. `run` may return { nextIn } to set its own cadence,
  *     or { retire: true } to stop polling an item; after `retireAfter` failures in a
- *     row an item is retired on its own.
+ *     row an item is retired on its own, and rechecked once every `retireRecheck` (30 d).
  *
  *   daemon.pipeline({ name, every, gate(ctx), steps: [{ name, run(ctx) }] })
  *     A bulk import: `gate` says whether there is anything new (a HEAD stamp), the
@@ -32,7 +33,9 @@ import { DEFAULT_SHARES, planNext, planUndated, quotas, tierFor, TIERS } from '.
  *     the cadence module turns them into the next read, which `save` writes back.
  *
  * A 429 (or a FetchError carrying retryAfterMs) holds the whole host back, not just
- * the item, and does not count as the item failing. status() is what /health and
+ * the item, and does not count as the item failing. A queue item or feed whose target
+ * is slow or broken (timeout, DNS/TLS/connection error, 5xx; see flag.js) is flagged and
+ * not tried again for `flagFor` (30 d), instead of walking the error ladder. status() is what /health and
  * /api/v1/daemon serve; onRun and onStall are the hooks for a site's own run log and
  * alerting.
  */
@@ -67,6 +70,9 @@ export function createDaemon({
   log = defaultLog(name),
   onRun,
   onStall,
+  // The fleet crawler rule's defaults for queue and feeds tasks (each task may override).
+  flagFor: flagForDefault = FLAG_FOR_MS,
+  retireRecheck: retireRecheckDefault = RETIRE_RECHECK_MS,
   now = Date.now,
 } = {}) {
   const gate = fetchOptions.gate ?? hostGate({ concurrency: fetchOptions.perHost ?? 1, delayMs: fetchOptions.delayMs ?? 1000, now });
@@ -97,6 +103,11 @@ export function createDaemon({
       timeoutMs: ms(spec.timeout ?? '10m'),
       ladder: spec.backoff ?? DEFAULT_LADDER,
       retireAfter: spec.retireAfter ?? null,
+      // Slow/broken targets wait this long (false: the ladder, as before 0.4.0). Jobs and
+      // pipelines are whole syncs, not one target, so they keep the ladder unless asked.
+      flagMs: durationOrOff(spec.flagFor !== undefined ? spec.flagFor : kind === 'queue' || kind === 'feeds' ? flagForDefault : false),
+      retireRecheckMs: durationOrOff(spec.retireRecheck !== undefined ? spec.retireRecheck : retireRecheckDefault),
+      classify: spec.classify ?? failureClass,
       staleAfter: spec.staleAfter ? ms(spec.staleAfter) : null,
       concurrency: spec.concurrency ?? (kind === 'queue' ? 2 : kind === 'feeds' ? 16 : 1),
       perHost: spec.perHost ?? 1,
@@ -266,22 +277,47 @@ export function createDaemon({
   }
   const held = (host) => host && (heldHosts.get(String(host).toLowerCase()) ?? 0) > now();
 
+  /**
+   * The schedule after a failure: retired (rechecked every retireRecheck), flagged slow or
+   * broken (left alone flagFor), or the error ladder. A run aborted because the daemon is
+   * stopping is not the target's fault and keeps the ladder.
+   */
+  function planFailure(t, err, fails, signal) {
+    const stopping = signal?.aborted && !(signal.reason instanceof FetchError);
+    const plan = flagPlan(err, {
+      fails,
+      retireAfter: t.retireAfter,
+      flagFor: stopping ? false : t.flagMs,
+      retireRecheck: t.retireRecheckMs,
+      ladderMs: ladderAt(t.ladder, fails),
+      // Our own per-run timeout fired: whatever the run threw on the way out, the target was slow.
+      classify: (e) => (signal?.aborted && signal.reason instanceof FetchError && signal.reason.code === 'timeout' ? 'slow' : t.classify(e)),
+    });
+    return plan.flag && plan.nextIn !== Infinity ? { ...plan, nextIn: spread(plan.nextIn) } : plan;
+  }
+
   async function attempt(t, key, fn, host) {
-    const rec = { ...((await runs(t)).get(key) ?? { key, lastTry: null, lastOk: null, nextAt: null, fails: 0, lastError: null }) };
+    const rec = { ...((await runs(t)).get(key) ?? { key, lastTry: null, lastOk: null, nextAt: null, fails: 0, lastError: null, flag: null, flaggedAt: null }) };
     const started = now();
     rec.lastTry = started;
     const ac = new AbortController();
     const stopListener = () => ac.abort(new Error('daemon stopping'));
     controller.signal.addEventListener('abort', stopListener, { once: true });
-    const timeout = setTimeout(() => ac.abort(new Error(`timed out after ${t.timeoutMs} ms`)), t.timeoutMs);
+    const timeout = setTimeout(() => ac.abort(new FetchError('timeout', `timed out after ${t.timeoutMs} ms`)), t.timeoutMs);
     let outcome;
     try {
       const result = (await fn(ctxFor(t, key, ac.signal))) ?? {};
       rec.lastOk = now();
       rec.fails = 0;
       rec.lastError = null;
-      if (result.retire) rec.nextAt = Number.MAX_SAFE_INTEGER;
-      else rec.nextAt = now() + spread(result.nextIn !== undefined ? ms(result.nextIn) : t.every);
+      rec.flag = null;
+      rec.flaggedAt = null;
+      if (result.retire) {
+        // The site said this item is gone: that stays its call, for good.
+        rec.nextAt = Number.MAX_SAFE_INTEGER;
+        rec.flag = 'retired';
+        rec.flaggedAt = now();
+      } else rec.nextAt = now() + spread(result.nextIn !== undefined ? ms(result.nextIn) : t.every);
       t.ok++;
       t.lastOk = rec.lastOk;
       t.stalled = false;
@@ -296,18 +332,21 @@ export function createDaemon({
       } else {
         rec.fails++;
         rec.lastError = String(err?.message ?? err).slice(0, 500);
-        rec.nextAt = t.retireAfter && rec.fails >= t.retireAfter ? Number.MAX_SAFE_INTEGER : now() + ladderAt(t.ladder, rec.fails);
+        const plan = planFailure(t, err, rec.fails, ac.signal);
+        rec.flag = plan.flag;
+        rec.flaggedAt = plan.flag ? now() : null;
+        rec.nextAt = plan.nextIn === Infinity ? Number.MAX_SAFE_INTEGER : now() + plan.nextIn;
         t.failed++;
         t.lastError = `${key === '*' ? '' : `${key}: `}${rec.lastError}`;
-        outcome = { ok: false, error: err, retired: rec.nextAt === Number.MAX_SAFE_INTEGER };
-        log(`[${t.name}${key === '*' ? '' : ` ${key}`}] failed (${rec.fails} in a row): ${rec.lastError}`);
+        outcome = { ok: false, error: err, retired: plan.flag === 'retired', flagged: plan.flag };
+        log(`[${t.name}${key === '*' ? '' : ` ${key}`}] failed (${rec.fails} in a row)${plan.flag ? `, ${plan.flag} until ${new Date(rec.nextAt).toISOString()}` : ''}: ${rec.lastError}`);
       }
     } finally {
       clearTimeout(timeout);
       controller.signal.removeEventListener('abort', stopListener);
     }
     await record(t, rec);
-    const entry = { job: t.name, kind: t.kind, key, ok: outcome.ok, held: !!outcome.held, retired: !!outcome.retired, ms: now() - started, at: started, error: outcome.error ? rec.lastError : null };
+    const entry = { job: t.name, kind: t.kind, key, ok: outcome.ok, held: !!outcome.held, retired: !!outcome.retired, flagged: outcome.flagged ?? null, ms: now() - started, at: started, error: outcome.error ? rec.lastError : null };
     history.push(entry);
     if (history.length > 200) history.shift();
     if (onRun) await Promise.resolve(onRun(entry, outcome.result)).catch((e) => log(`onRun hook failed: ${e.message}`));
@@ -467,7 +506,7 @@ export function createDaemon({
     const ac = new AbortController();
     const stopListener = () => ac.abort(new Error('daemon stopping'));
     controller.signal.addEventListener('abort', stopListener, { once: true });
-    const timeout = setTimeout(() => ac.abort(new Error(`timed out after ${t.timeoutMs} ms`)), t.timeoutMs);
+    const timeout = setTimeout(() => ac.abort(new FetchError('timeout', `timed out after ${t.timeoutMs} ms`)), t.timeoutMs);
     const ctx = ctxFor(t, c.key, ac.signal);
     const tierStats = t.byTier[c.tier] ?? (t.byTier[c.tier] = { ok: 0, failed: 0 });
     let outcome;
@@ -487,10 +526,13 @@ export function createDaemon({
       if (retryAfter !== null && c.host) {
         // The host asked us to slow down: hold all of it, and do not count it against the feed.
         holdHost(c.host, retryAfter);
-        failure = { error: message, held: true, fails: null, minutes: Math.ceil(ms(retryAfter) / 60_000), retire: false };
+        failure = { error: message, held: true, fails: null, minutes: Math.ceil(ms(retryAfter) / 60_000), retire: false, flag: null };
       } else {
         const fails = Number(t.spec.fails ? t.spec.fails(c.feed) : (c.feed.fails ?? 0)) + 1;
-        failure = { error: message, held: false, fails, minutes: Math.ceil(ladderAt(t.ladder, fails) / 60_000), retire: Boolean(t.retireAfter && fails >= t.retireAfter) };
+        const plan = planFailure(t, err, fails, ac.signal);
+        // A retired feed (retireRecheck off) keeps the ladder's minutes, as before 0.4.0: the site decides what retired means.
+        const wait = plan.nextIn === Infinity ? ladderAt(t.ladder, fails) : plan.nextIn;
+        failure = { error: message, held: false, fails, minutes: Math.ceil(wait / 60_000), retire: plan.flag === 'retired', flag: plan.flag };
         t.failed++;
         tierStats.failed++;
         t.lastError = `${c.key}: ${message}`;
@@ -501,12 +543,12 @@ export function createDaemon({
       } catch (e) {
         log(`[${t.name} ${c.key}] could not record the failure: ${e?.message ?? e}`);
       }
-      outcome = { ok: false, held: failure.held, retired: failure.retire, error: err };
+      outcome = { ok: false, held: failure.held, retired: failure.retire, flagged: failure.flag, error: err };
     } finally {
       clearTimeout(timeout);
       controller.signal.removeEventListener('abort', stopListener);
     }
-    const entry = { job: t.name, kind: t.kind, key: c.key, tier: c.tier, ok: outcome.ok, held: !!outcome.held, retired: !!outcome.retired, ms: now() - started, at: started, error: outcome.error ? String(outcome.error?.message ?? outcome.error).slice(0, 500) : null };
+    const entry = { job: t.name, kind: t.kind, key: c.key, tier: c.tier, ok: outcome.ok, held: !!outcome.held, retired: !!outcome.retired, flagged: outcome.flagged ?? null, ms: now() - started, at: started, error: outcome.error ? String(outcome.error?.message ?? outcome.error).slice(0, 500) : null };
     history.push(entry);
     if (history.length > 200) history.shift();
     if (onRun) await Promise.resolve(onRun(entry, outcome.result)).catch((e) => log(`onRun hook failed: ${e.message}`));
@@ -753,15 +795,17 @@ export function createDaemon({
           let due = 0;
           let retired = 0;
           let failing = 0;
+          let flagged = 0;
           let never = 0;
           for (const k of items.keys()) {
             const x = r.get(k);
             if (!x) never++;
-            else if (x.nextAt === Number.MAX_SAFE_INTEGER) retired++;
-            else if ((x.nextAt ?? 0) <= now()) due++;
+            else if (x.flag === 'retired' || x.nextAt === Number.MAX_SAFE_INTEGER) retired++;
+            else if (x.flag === 'slow' || x.flag === 'broken') flagged++;
+            if (x && x.nextAt !== Number.MAX_SAFE_INTEGER && (x.nextAt ?? 0) <= now()) due++;
             if (x?.fails) failing++;
           }
-          out.push({ ...base, items: items.size, due: due + never, neverRun: never, failing, retired });
+          out.push({ ...base, items: items.size, due: due + never, neverRun: never, failing, flagged, retired });
         } else {
           const x = r.get('*');
           out.push({ ...base, nextAt: x?.nextAt ?? null, fails: x?.fails ?? 0, progress: t.kind === 'pipeline' ? await bounded((async () => (await storeReady()).get(`${t.name}:progress`))(), null) : undefined });
@@ -792,6 +836,12 @@ export function createDaemon({
     },
   };
   return api;
+}
+
+/** A duration, or false for "off" (false, 0, null, 'off'). */
+function durationOrOff(v) {
+  if (v === false || v === null || v === 0 || v === 'off') return false;
+  return ms(v);
 }
 
 function defaultLog(name) {

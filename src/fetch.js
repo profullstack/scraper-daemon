@@ -2,12 +2,15 @@ import { lookup as dnsLookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import { hostGate } from './gate.js';
 import { robotsAllows } from './robots.js';
+import { CRAWL_FETCH_TIMEOUT_MS } from './flag.js';
 
 /**
  * The one way a daemon job reads the web: polite (per-host gate, robots.txt) and
  * safe (http(s) on 80/443 only, every resolved address public, every redirect hop
  * re-checked, time and size capped). Errors are FetchError with a `code` a job can
- * branch on: blocked, robots, status, timeout, too-large, network.
+ * branch on: blocked, robots, status, timeout, too-large, network. `timeoutMs` (10 s by
+ * default, the fleet crawler rule) is the budget for the whole request: every redirect
+ * hop, the headers and the body.
  */
 export class FetchError extends Error {
   constructor(code, message, extra = {}) {
@@ -42,9 +45,16 @@ export function retryAfter(value, now = Date.now) {
   return Number.isFinite(t) ? Math.max(0, t - now()) : null;
 }
 
+/** A thrown fetch/read error as a FetchError: timeout when the budget ran out, network otherwise (the system code kept on `causeCode`). */
+function asFetchError(err, host, deadline) {
+  const timedOut = err?.name === 'TimeoutError' || err?.cause?.name === 'TimeoutError' || Boolean(deadline?.aborted);
+  const code = err?.cause?.code ?? err?.code;
+  return new FetchError(timedOut ? 'timeout' : 'network', `${host}: ${err?.message ?? err}${code && !timedOut ? ` (${code})` : ''}`, { cause: err?.cause ?? err, ...(code ? { causeCode: code } : {}) });
+}
+
 export function createFetcher({
   userAgent = 'scraper-daemon (+https://github.com/profullstack/scraper-daemon)',
-  timeoutMs = 15_000,
+  timeoutMs = CRAWL_FETCH_TIMEOUT_MS,
   maxBytes = 2_000_000,
   maxRedirects = 5,
   robots = true,
@@ -68,14 +78,23 @@ export function createFetcher({
     if (u.port && u.port !== '80' && u.port !== '443') throw new FetchError('blocked', `only ports 80 and 443: ${url}`);
     if (allowPrivate) return u;
     const host = u.hostname.replace(/^\[|\]$/g, '');
-    const addrs = isIP(host) ? [{ address: host }] : await lookup(host).catch(() => []);
-    if (!addrs.length) throw new FetchError('network', `no address for ${host}`);
+    let dnsCode = null;
+    const addrs = isIP(host)
+      ? [{ address: host }]
+      : await lookup(host).catch((err) => {
+          dnsCode = err?.code ?? null;
+          return [];
+        });
+    // dnsCode tells "no such host" (ENOTFOUND: the site is broken) from our resolver failing (EAI_AGAIN).
+    if (!addrs.length) throw new FetchError('network', `no address for ${host}${dnsCode ? ` (${dnsCode})` : ''}`, { dnsCode });
     if (!addrs.every((a) => isPublicAddress(a.address))) throw new FetchError('blocked', `${host} resolves to a private address`);
     return u;
   }
 
-  async function raw(url, { accept, signal, method = 'GET', headers = {} } = {}) {
+  async function raw(url, { accept, signal, method = 'GET', headers = {}, deadline = AbortSignal.timeout(timeoutMs) } = {}) {
     let at = url;
+    // One budget for every hop (and, through text(), the body), not one per hop.
+    const sig = signal ? AbortSignal.any([signal, deadline]) : deadline;
     for (let hop = 0; hop <= maxRedirects; hop++) {
       const u = await check(at);
       const res = await gate.run(u.host, () =>
@@ -83,11 +102,11 @@ export function createFetcher({
           method,
           redirect: 'manual',
           headers: { 'user-agent': userAgent, accept: accept ?? '*/*', ...headers },
-          signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs),
+          signal: sig,
         }),
       ).catch((err) => {
         if (err instanceof FetchError) throw err;
-        throw new FetchError(err?.name === 'TimeoutError' ? 'timeout' : 'network', `${u.host}: ${err?.message ?? err}`);
+        throw asFetchError(err, u.host, deadline);
       });
       const location = res.headers.get('location');
       if (res.status >= 300 && res.status < 400 && location) {
@@ -100,7 +119,20 @@ export function createFetcher({
     throw new FetchError('blocked', `more than ${maxRedirects} redirects from ${url}`);
   }
 
-  async function body(res) {
+  async function body(res, deadline) {
+    try {
+      return await readBody(res);
+    } catch (err) {
+      if (err instanceof FetchError) throw err;
+      let host = 'unknown';
+      try {
+        host = new URL(res.url).host;
+      } catch {}
+      throw asFetchError(err, host, deadline);
+    }
+  }
+
+  async function readBody(res) {
     const declared = Number(res.headers.get('content-length'));
     if (declared > maxBytes) {
       res.body?.cancel().catch(() => {});
@@ -152,7 +184,8 @@ export function createFetcher({
   /** GET a page: { url (after redirects), status, headers, text }. Throws FetchError on anything but 2xx. */
   async function text(url, opts = {}) {
     if (!(await allowed(url, opts.signal))) throw new FetchError('robots', `robots.txt disallows ${url}`);
-    const { res, url: final } = await raw(url, opts);
+    const deadline = AbortSignal.timeout(timeoutMs);
+    const { res, url: final } = await raw(url, { ...opts, deadline });
     if (!res.ok) {
       res.body?.cancel().catch(() => {});
       const extra = { status: res.status, url: final };
@@ -160,7 +193,7 @@ export function createFetcher({
       if (res.status === 429 || (res.status === 503 && res.headers.get('retry-after'))) extra.retryAfterMs = retryAfter(res.headers.get('retry-after'), now) ?? 30 * 60_000;
       throw new FetchError('status', `${res.status} from ${final}`, extra);
     }
-    return { url: final, status: res.status, headers: res.headers, text: await body(res) };
+    return { url: final, status: res.status, headers: res.headers, text: await body(res, deadline) };
   }
 
   async function json(url, opts = {}) {

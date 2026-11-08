@@ -24,6 +24,9 @@ try {
   // A row as 0.1.0 wrote it through Bun's SQL: a jsonb string holding JSON text.
   await sql.unsafe(`CREATE TABLE ${PREFIX}_state (key text PRIMARY KEY, value jsonb NOT NULL)`);
   await sql.unsafe(`INSERT INTO ${PREFIX}_state VALUES ('old', to_jsonb('{"page":3}'::text)), ('plain', to_jsonb('stamp'::text))`);
+  // A runs table as 0.3.x made it: no flag / flagged_at columns.
+  await sql.unsafe(`CREATE TABLE ${PREFIX}_runs (job text NOT NULL, key text NOT NULL, last_try bigint, last_ok bigint, next_at bigint, fails integer NOT NULL DEFAULT 0, last_error text, PRIMARY KEY (job, key))`);
+  await sql.unsafe(`INSERT INTO ${PREFIX}_runs (job, key, last_try, fails) VALUES ('j', 'legacy', 1, 2)`);
   const s = pgStore(query, { prefix: PREFIX });
   check(sorted(await s.get('old')) === sorted({ page: 3 }), 'a 0.1.0 double-encoded object is unwrapped on init');
   check((await s.get('plain')) === 'stamp', 'a plain string stays a string');
@@ -38,6 +41,12 @@ try {
   await s.save('j', { key: 'k', lastTry: 4, lastOk: null, nextAt: Number.MAX_SAFE_INTEGER, fails: 1, lastError: 'x' });
   const rec = (await s.load('j')).get('k');
   check(rec.nextAt === Number.MAX_SAFE_INTEGER && rec.lastOk === null, 'runs round trip', JSON.stringify(rec));
+  const legacy = (await s.load('j')).get('legacy');
+  check(legacy && legacy.fails === 2 && legacy.flag === null && legacy.flaggedAt === null, 'a 0.3.x runs table gains flag + flagged_at', JSON.stringify(legacy));
+  const flaggedAt = Date.now();
+  await s.save('j', { key: 'slow', lastTry: flaggedAt, lastOk: null, nextAt: flaggedAt + 30 * 86_400_000, fails: 1, lastError: 'timed out', flag: 'slow', flaggedAt });
+  const slow = (await s.load('j')).get('slow');
+  check(slow.flag === 'slow' && slow.flaggedAt === flaggedAt && slow.nextAt === flaggedAt + 30 * 86_400_000, 'a flagged record round trips', JSON.stringify(slow));
 } finally {
   await sql.unsafe(`DROP TABLE IF EXISTS ${PREFIX}_runs, ${PREFIX}_state`);
   await sql.close();

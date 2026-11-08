@@ -153,8 +153,12 @@ describe('daemon', () => {
     await d.runNow('feeds', 'broken');
     const runs = await d.store.load('feeds');
     assert.ok(runs.get('fast').nextAt - Date.now() <= 300_000 + 50);
+    // { retire: true } is the site's own call and stays for good.
     assert.equal(runs.get('gone').nextAt, Number.MAX_SAFE_INTEGER);
-    assert.equal(runs.get('broken').nextAt, Number.MAX_SAFE_INTEGER);
+    assert.equal(runs.get('gone').flag, 'retired');
+    // retireAfter is not forever any more: one recheck every 30 days.
+    assert.equal(runs.get('broken').flag, 'retired');
+    assert.ok(Math.abs(runs.get('broken').nextAt - (Date.now() + 30 * 86_400_000)) < 1000);
     assert.equal(n, 2);
     const s = (await d.status()).tasks[0];
     assert.equal(s.retired, 2);
@@ -228,7 +232,10 @@ describe('stores', () => {
       await s.save('j', { key: 'k', lastTry: 1, lastOk: 2, nextAt: 3, fails: 0, lastError: null });
       await s.save('j', { key: 'k', lastTry: 4, lastOk: 2, nextAt: 9, fails: 1, lastError: 'x' });
       const got = (await s.load('j')).get('k');
-      assert.deepEqual(got, { key: 'k', lastTry: 4, lastOk: 2, nextAt: 9, fails: 1, lastError: 'x' });
+      assert.deepEqual(got, { key: 'k', lastTry: 4, lastOk: 2, nextAt: 9, fails: 1, lastError: 'x', flag: null, flaggedAt: null });
+      await s.save('j', { key: 'f', lastTry: 5, lastOk: null, nextAt: 5 + 30 * 86_400_000, fails: 1, lastError: 'timed out', flag: 'slow', flaggedAt: 5 });
+      assert.deepEqual((await s.load('j')).get('f'), { key: 'f', lastTry: 5, lastOk: null, nextAt: 5 + 30 * 86_400_000, fails: 1, lastError: 'timed out', flag: 'slow', flaggedAt: 5 });
+      await s.forget('j', ['f']);
       await s.set('cursor', { page: 3 });
       assert.deepEqual(await s.get('cursor'), { page: 3 });
       await s.forget('j', ['k']);

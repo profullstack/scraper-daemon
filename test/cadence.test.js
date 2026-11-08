@@ -132,7 +132,9 @@ describe('daemon.feeds', () => {
       ...Array.from({ length: 20 }, (_, i) => ({ id: `s${i}`, tier: 'slow', url: `https://s${i}.example/feed`, dates: posts(10, WEEK) })),
     ];
     const s = site(rows);
-    const d = createDaemon({ log: quiet, concurrency: 10, tickMs: 60_000 });
+    // The posts are dated against NOW, so the daemon's clock must be NOW too (with the wall
+    // clock a hot feed goes quiet as the calendar moves on, and this test rotted after a day).
+    const d = createDaemon({ log: quiet, concurrency: 10, tickMs: 60_000, now: () => NOW });
     d.feeds(s.spec);
     d.start();
     await new Promise((r) => setTimeout(r, 50));
@@ -143,7 +145,7 @@ describe('daemon.feeds', () => {
     assert.equal(s.asked[0][0], 'hot');
     for (const { feed, plan } of s.saved) {
       assert.equal(plan.tier, feed.tier === 'hot' ? 'hot' : 'slow');
-      assert.ok(plan.nextAt > Date.now());
+      assert.ok(plan.nextAt > NOW);
     }
   });
 

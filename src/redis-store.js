@@ -17,7 +17,7 @@ export function redisStore(client, { prefix = 'sd' } = {}) {
       const out = new Map();
       for (const [k, v] of Object.entries(all ?? {})) {
         try {
-          out.set(k, JSON.parse(v));
+          out.set(k, { flag: null, flaggedAt: null, ...JSON.parse(v) });
         } catch {}
       }
       return out;

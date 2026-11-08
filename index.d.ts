@@ -16,7 +16,14 @@ export interface RunRecord {
   nextAt: number | null;
   fails: number;
   lastError: string | null;
+  /** 'slow' | 'broken': flagged by the crawler rule until nextAt (30 d); 'retired'; null: fine. Since 0.4.0. */
+  flag?: Flag | null;
+  /** When the flag was set (the failure time). */
+  flaggedAt?: number | null;
 }
+
+export type Flag = 'slow' | 'broken' | 'retired';
+export type FailureClass = 'slow' | 'broken' | null;
 
 export interface Fetched {
   url: string;
@@ -56,6 +63,16 @@ export interface TaskOptions {
   backoff?: Duration[];
   staleAfter?: Duration;
   concurrency?: number;
+  /**
+   * How long a slow or broken target (timeout, DNS/TLS/connection error, 5xx) is left alone
+   * instead of walking `backoff`. Default '30d' for queue and feeds, false for job and pipeline.
+   * false restores the pre-0.4.0 ladder (uptime monitors, calls to your own services).
+   */
+  flagFor?: Duration | false;
+  /** How often an item retired by `retireAfter` is rechecked. Default '30d'; false = retired for good (pre-0.4.0). */
+  retireRecheck?: Duration | false;
+  /** Override how a thrown error is classified (default failureClass). */
+  classify?(err: unknown): FailureClass;
 }
 
 export interface Item {
@@ -108,8 +125,10 @@ export interface FeedFailure {
   fails: number | null;
   minutes: number;
   nextAt: number;
-  /** `retireAfter` failures in a row. */
+  /** `retireAfter` failures in a row (minutes is then the 30-day recheck). */
   retire: boolean;
+  /** 'slow' | 'broken' (minutes is then 30 days), 'retired', or null (the ladder). Since 0.4.0. */
+  flag: Flag | null;
 }
 
 export interface Daemon {
@@ -174,6 +193,7 @@ export interface RunEntry {
   ok: boolean;
   held: boolean;
   retired: boolean;
+  flagged: Flag | null;
   ms: number;
   at: number;
   error: string | null;
@@ -197,6 +217,10 @@ export function createDaemon(opts?: {
   log?: (...args: unknown[]) => void;
   onRun?: (entry: RunEntry, result?: unknown) => unknown;
   onStall?: (s: { job: string; lastOk: number | null; lastError: string | null }) => unknown;
+  /** Default flagFor for queue and feeds tasks ('30d'). */
+  flagFor?: Duration | false;
+  /** Default retireRecheck ('30d'). */
+  retireRecheck?: Duration | false;
   now?: () => number;
 }): Daemon;
 
@@ -215,11 +239,32 @@ export function createFetcher(opts?: {
 }): Fetcher;
 
 export class FetchError extends Error {
+  constructor(code: FetchError['code'], message: string, extra?: Record<string, unknown>);
   code: 'blocked' | 'robots' | 'status' | 'timeout' | 'too-large' | 'network';
   status?: number;
   url?: string;
   retryAfterMs?: number;
+  /** DNS lookup error code (ENOTFOUND, EAI_AGAIN) for a 'network' error from the resolver. */
+  dnsCode?: string | null;
+  /** System error code under a 'network' error (ECONNREFUSED, CERT_HAS_EXPIRED, ...). */
+  causeCode?: string;
 }
+
+/** 10_000: the fleet's budget for one plain HTTP fetch (and createFetcher's default timeoutMs). */
+export const CRAWL_FETCH_TIMEOUT_MS: number;
+/** 30_000: the fleet's navigation budget for a headless-browser render. */
+export const CRAWL_BROWSER_TIMEOUT_MS: number;
+/** 30 days in ms: how long a slow or broken target is left alone. */
+export const FLAG_FOR_MS: number;
+/** 30 days in ms: how often a retired item is rechecked. */
+export const RETIRE_RECHECK_MS: number;
+/** 'slow' (timeouts), 'broken' (DNS/TLS/connection errors, 5xx) or null (keep the ladder). */
+export function failureClass(err: unknown): FailureClass;
+/** The schedule after a failure, as a pure function. nextIn is ms (Infinity: never). */
+export function flagPlan(
+  err: unknown,
+  opts?: { fails?: number; retireAfter?: number | null; flagFor?: number | false; retireRecheck?: number | false; ladderMs?: number; classify?: (err: unknown) => FailureClass },
+): { flag: Flag | null; nextIn: number };
 
 export function hostGate(opts?: { concurrency?: number; delayMs?: number }): {
   run<T>(host: string, fn: () => Promise<T>): Promise<T>;
